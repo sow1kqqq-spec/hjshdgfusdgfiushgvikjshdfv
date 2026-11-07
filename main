@@ -1,0 +1,283 @@
+import asyncio
+import logging
+import sqlite3
+from contextlib import closing
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+BOT_TOKEN = "9215268133:AAELSu4anvzKLV610HT0ujS0mTg5Y_6jHlQ"
+CHANNEL_ID = "@vk_only_News"
+CHANNEL_URL = "https://t.me/vk_only_News"
+ADMIN_IDS = {6668784806}
+DB_PATH = "bot.db"
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("emoji_bot")
+
+router = Router()
+
+
+def db_init() -> None:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id     INTEGER PRIMARY KEY,
+                display_name TEXT,
+                joined_at   TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con.commit()
+
+
+def db_add_user(user_id: int, display_name: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.execute(
+            "INSERT OR IGNORE INTO users (user_id, display_name) VALUES (?, ?)",
+            (user_id, display_name),
+        )
+        con.commit()
+
+
+def db_user_count() -> int:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        return con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def db_all_user_ids() -> list[int]:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        return [r[0] for r in con.execute("SELECT user_id FROM users").fetchall()]
+
+
+SUBBED_STATUSES = {
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.CREATOR,
+}
+
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in SUBBED_STATUSES
+    except TelegramBadRequest:
+        return False
+
+
+def sub_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Подписаться", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="✅ Проверить", callback_data="check_sub")],
+        ]
+    )
+
+
+def admin_entry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="open_admin")]
+        ]
+    )
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_broadcast")],
+        ]
+    )
+
+
+WELCOME_TEXT = (
+    "Привет, {name}!\n"
+    "Чтобы пользоваться ботом, подпишись на телеграм канал с новостями:"
+)
+PROMPT_TEXT = "Скиньте премиум эмодзи/стикер в чат, чтобы получить его id!"
+NOT_SUBBED_TEXT = "Вы ещё не подписаны на канал."
+CHECKING_TEXT = "Проверяю подписку..."
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, bot: Bot) -> None:
+    db_add_user(message.from_user.id, message.from_user.full_name)
+
+    if not await is_subscribed(bot, message.from_user.id):
+        await message.answer(
+            WELCOME_TEXT.format(name=message.from_user.full_name),
+            reply_markup=sub_keyboard(),
+        )
+        return
+
+    if is_admin(message.from_user.id):
+        await message.answer(PROMPT_TEXT, reply_markup=admin_entry_keyboard())
+    else:
+        await message.answer(PROMPT_TEXT)
+
+
+@router.callback_query(F.data == "check_sub")
+async def cb_check_sub(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer(CHECKING_TEXT)
+    if await is_subscribed(bot, call.from_user.id):
+        if is_admin(call.from_user.id):
+            await call.message.edit_text(PROMPT_TEXT, reply_markup=admin_entry_keyboard())
+        else:
+            await call.message.edit_text(PROMPT_TEXT)
+    else:
+        await call.answer(NOT_SUBBED_TEXT, show_alert=True)
+
+
+def extract_custom_emoji_ids(message: Message) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+
+    if message.sticker and message.sticker.custom_emoji_id:
+        found.append((message.sticker.custom_emoji_id, message.sticker.emoji or "🙂"))
+
+    entities = message.entities or message.caption_entities or []
+    text = message.text or message.caption or ""
+    for ent in entities:
+        if ent.type == "custom_emoji" and ent.custom_emoji_id:
+            char = text[ent.offset: ent.offset + ent.length] if text else "🙂"
+            found.append((ent.custom_emoji_id, char))
+
+    return found
+
+
+def format_result(ids: list[tuple[str, str]]) -> str:
+    lines = [f"Обнаружены премиум эмодзи ({len(ids)}):\n"]
+    lines.append("Все custom_emoji_id:")
+    lines.append(", ".join(eid for eid, _ in ids))
+    lines.append("")
+
+    for i, (eid, char) in enumerate(ids, 1):
+        lines.append(f"{i}.")
+        lines.append(f"custom_emoji_id: {eid}")
+        lines.append("HTML:")
+        lines.append(f'<tg-emoji emoji-id="{eid}">{char}</tg-emoji>')
+        lines.append("Markdown:")
+        lines.append(f"![{char}](tg://emoji?id={eid})")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+@router.message(StateFilter(None), F.sticker | F.entities | F.caption_entities)
+async def handle_emoji_input(message: Message, bot: Bot) -> None:
+    if not await is_subscribed(bot, message.from_user.id):
+        await message.answer(
+            WELCOME_TEXT.format(name=message.from_user.full_name),
+            reply_markup=sub_keyboard(),
+        )
+        return
+
+    ids = extract_custom_emoji_ids(message)
+    if not ids:
+        return
+
+    await message.answer(format_result(ids), parse_mode=None)
+
+
+class Broadcast(StatesGroup):
+    waiting_content = State()
+
+
+@router.callback_query(F.data == "open_admin")
+async def cb_open_admin(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    await call.message.answer("Админ-панель:", reply_markup=admin_keyboard())
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_stats")
+async def cb_adm_stats(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    count = db_user_count()
+    await call.message.answer(f"👥 Пользователей в боте: {count}")
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_broadcast")
+async def cb_adm_broadcast(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    await state.set_state(Broadcast.waiting_content)
+    await call.message.answer(
+        "Пришлите сообщение для рассылки (текст/фото/видео/документ). /cancel — отмена."
+    )
+    await call.answer()
+
+
+@router.message(Command("cancel"), StateFilter(Broadcast.waiting_content))
+async def cmd_cancel_broadcast(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Рассылка отменена.")
+
+
+@router.message(StateFilter(Broadcast.waiting_content))
+async def do_broadcast(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    await state.clear()
+    user_ids = db_all_user_ids()
+    sent, failed = 0, 0
+
+    status_msg = await message.answer(f"Рассылка запущена: 0 / {len(user_ids)}")
+
+    for i, uid in enumerate(user_ids, 1):
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            sent += 1
+        except TelegramForbiddenError:
+            failed += 1
+        except TelegramBadRequest:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+        if i % 25 == 0:
+            try:
+                await status_msg.edit_text(f"Рассылка: {i} / {len(user_ids)}")
+            except TelegramBadRequest:
+                pass
+
+    await status_msg.edit_text(f"Готово. Отправлено: {sent}, не доставлено: {failed}.")
+
+
+async def main() -> None:
+    db_init()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
